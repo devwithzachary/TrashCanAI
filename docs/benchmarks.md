@@ -104,3 +104,4 @@ See [`docs/benchmark-setup-guide.md`](benchmark-setup-guide.md) for OS tuning an
 | **M4 Max Studio** | Desktop Apple Silicon | High-speed unified SoC | **70.0 tok/s** | **14.3 s** | Finishes 7B tasks **5.4x faster** than Mac Pro |
 
 > **Operational Tip:** With `performance` governor and DPM `high` active, the 2013 Mac Pro idles near ~120 W (`2.88 kWh/day` if left running 24/7). Use Wake-on-LAN or a smart plug for on-demand workdays rather than continuous 24/7 idling. Live RAPL + Apple SMC power monitoring is built directly into `sudo trash-top`.
+

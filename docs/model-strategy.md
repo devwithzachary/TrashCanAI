@@ -35,3 +35,4 @@ To extract maximum performance from the Mac Pro's hardware profile (Dual 3 GB Fi
 * **Why it shines**: Modern 8 GB laptops OOM completely on 14B and 32B models. The Mac Pro's 64 GB Quad-Channel ECC DDR3 handles them reliably, especially with Linux Transparent Huge Pages (`always`) enabled and physical core count `-t 12` (avoiding hyperthread cache contention).
 * **14B Hybrid (`trash-deep`)**: 24/48 layers on dual D500s + Xeon CPU reaches **27.6 tok/s prefill / 6.40 tok/s generation**.
 * **32B Pure CPU (`trash-heavy`)**: Pure CPU (`-ngl 0 -t 12`) avoids PCIe activation bounce overhead and runs steadily in quad-channel ECC RAM (**9.06 tok/s prefill / 2.53 tok/s generation**).
+

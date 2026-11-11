@@ -43,3 +43,4 @@ Wiring JetBrains **External Tools** to [`scripts/trash-ai`](../scripts/trash-ai)
 | **Proofread Selection (3B)** | `trash-ai` | `--host <MAC_PRO_IP> spellcheck -s "$SelectedText$"` |
 
 Highlight lines in any Kotlin/Java/XML/Bash file -> Right-click -> **External Tools** -> **Review & Improve Code** while watching `sudo trash-top` over SSH.
+

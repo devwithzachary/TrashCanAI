@@ -135,3 +135,4 @@ To keep clocks, Transparent Huge Pages (THP), and cooling deterministic across r
     --tensor-split 1,1
 ```
 Look for two Vulkan devices (`AMD RADV TAHITI`) in startup logs.
+

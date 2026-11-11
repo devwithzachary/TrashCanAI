@@ -85,3 +85,4 @@ exec "${SERVER_BIN}" \
     --host "${HOST}" \
     --port "${PORT}" \
     --metrics
+

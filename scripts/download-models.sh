@@ -107,3 +107,4 @@ case "${CHOICE}" in
 esac
 
 echo "[✓] Download complete. Models saved to ${MODEL_DIR}"
+

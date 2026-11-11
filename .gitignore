@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+models/
+*.gguf
+*.log
+.ssh_key*
+llama.cpp/

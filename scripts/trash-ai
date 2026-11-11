@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+TrashCanAI CLI Helper (`trash-ai`)
+Routes daily coding, proofreading, hashtag, and vision alt-text tasks to a
+2013 Apple Mac Pro ("Trash Can") running `llama-server --models-preset` using
+each task's most hardware-optimized configuration.
+
+Environment variables:
+  TRASH_AI_HOST        Mac Pro IP or hostname (default: 127.0.0.1)
+  TRASH_AI_PORT        Router port (default: 8080)
+  TRASH_AI_SSH_TARGET  Optional SSH user@host to auto-start ~/serve.sh if offline
+  TRASH_AI_SSH_KEY     Optional path to SSH private key for auto-start
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import mimetypes
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+DEFAULT_HOST = os.environ.get("TRASH_AI_HOST") or os.environ.get("MACPRO_IP") or "127.0.0.1"
+DEFAULT_PORT = int(os.environ.get("TRASH_AI_PORT") or "8080")
+SSH_TARGET = os.environ.get("TRASH_AI_SSH_TARGET", "").strip()
+SSH_KEY = os.environ.get("TRASH_AI_SSH_KEY", "").strip()
+REPO_ROOT = Path(__file__).resolve().parent.parent
+PRESETS_LOCAL = REPO_ROOT / "scripts" / "trashcan-models.ini"
+MAX_FILE_CHARS = 10000
+
+MODEL_PROFILES: dict[str, dict[str, str]] = {
+    "trash-fast": {
+        "label": "Qwen 2.5 Coder 1.5B (Q8_0)",
+        "hardware": "Dual FirePro D500 100% VRAM (FA on)",
+        "speed": "392.5 pp / 36.6 tg tok/s",
+        "role": "Fast autocomplete & quick short snippets",
+    },
+    "trash-social": {
+        "label": "Qwen 2.5 3B Instruct (Q4_K_M)",
+        "hardware": "Dual FirePro D500 100% VRAM (FA on)",
+        "speed": "178.3 pp / 22.1 tg tok/s",
+        "role": "Spellcheck, grammar polishing & social hashtags",
+    },
+    "trash-code": {
+        "label": "Qwen 2.5 Coder 7B (Q4_K_M)",
+        "hardware": "Dual FirePro D500 28/28 layers (FA on)",
+        "speed": "74.4 pp / 13.0 tg tok/s",
+        "role": "Daily Kotlin / Android / Linux coding",
+    },
+    "trash-deep": {
+        "label": "Qwen 2.5 Coder 14B (Q4_K_M)",
+        "hardware": "Hybrid Dual D500 (24L) + 12c Xeon THP",
+        "speed": "27.6 pp / 6.40 tg tok/s",
+        "role": "Deep debugging & multi-component refactoring",
+    },
+    "trash-heavy": {
+        "label": "Qwen 2.5 Coder 32B (Q4_K_M)",
+        "hardware": "64 GB Quad-Channel ECC Pure CPU (-ngl 0 -t 12 THP)",
+        "speed": "9.06 pp / 2.53 tg tok/s",
+        "role": "Heavyweight 64 GB RAM architectural reasoning",
+    },
+    "trash-vision": {
+        "label": "Moondream2 (F16 + mmproj)",
+        "hardware": "Dual FirePro D500 100% VRAM (Vicuna)",
+        "speed": "1.75s ViT encoding (~7.8s total)",
+        "role": "Accessibility HTML alt-text & image inspection",
+    },
+}
+
+
+def base_url(host: str, port: int) -> str:
+    """Build the Mac Pro llama-server base URL."""
+    return f"http://{host}:{port}"
+
+
+def fetch_json(url: str, timeout: float = 2.0) -> dict[str, Any]:
+    """Fetch JSON from an HTTP endpoint."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def start_macpro_router(host: str, port: int) -> None:
+    """Optionally auto-start the router over SSH when TRASH_AI_SSH_TARGET is set."""
+    if not SSH_TARGET:
+        raise RuntimeError(
+            f"Mac Pro router at {base_url(host, port)} is unreachable. "
+            f"Start it on your Mac Pro with '~/serve.sh' (or set TRASH_AI_HOST=<ip> "
+            f"and optionally TRASH_AI_SSH_TARGET=user@<ip> for SSH auto-start)."
+        )
+
+    sys.stderr.write(f"[*] Starting TrashCanAI router via SSH ({SSH_TARGET}) on port {port}...\n")
+    sys.stderr.flush()
+
+    ssh_cmd = ["ssh"]
+    if SSH_KEY:
+        ssh_cmd.extend(["-i", SSH_KEY])
+    ssh_cmd.append(SSH_TARGET)
+
+    if PRESETS_LOCAL.exists():
+        ini_data = PRESETS_LOCAL.read_text(encoding="utf-8")
+        subprocess.run(
+            [*ssh_cmd, 'sed "s|/home/YOUR_USER/models|${HOME}/models|g" > ~/.trashcan-models.ini'],
+            input=ini_data,
+            text=True,
+            check=True,
+        )
+
+    launch_cmd = (
+        f"setsid ~/llama.cpp/build/bin/llama-server "
+        f"--models-preset ~/.trashcan-models.ini --models-max 1 "
+        f"--host 0.0.0.0 --port {port} --metrics "
+        f"> ~/llama-server.log 2>&1 < /dev/null &"
+    )
+    subprocess.run([*ssh_cmd, launch_cmd], check=True)
+
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        try:
+            fetch_json(f"{base_url(host, port)}/v1/models", timeout=1.5)
+            return
+        except Exception:
+            time.sleep(1.0)
+
+    raise RuntimeError(f"Timed out waiting for Mac Pro llama-server on {host}:{port}")
+
+
+def ensure_router(host: str, port: int) -> dict[str, Any]:
+    """Verify the Mac Pro router is live, auto-starting over SSH if configured."""
+    models_url = f"{base_url(host, port)}/v1/models"
+    try:
+        return fetch_json(models_url, timeout=2.0)
+    except Exception:
+        start_macpro_router(host, port)
+        return fetch_json(models_url, timeout=3.0)
+
+
+def read_file_excerpt(file_path: str, lines_spec: str | None = None) -> tuple[str, str | None]:
+    """Read a text file (or optional 1-indexed 'start-end' line span) safely."""
+    p = Path(file_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    raw_lines = p.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
+
+    span_label: str | None = None
+    if lines_spec:
+        parts = [x.strip() for x in lines_spec.split("-", 1)]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            start, end = int(parts[0]), int(parts[1])
+            if 1 <= start < end:
+                end = min(end, len(raw_lines))
+                selected = "".join(raw_lines[start - 1 : end])
+                if len(selected) > MAX_FILE_CHARS:
+                    selected = selected[:MAX_FILE_CHARS] + "\n... [truncated selection to fit 4K context]"
+                return selected, f"lines {start}-{end}"
+
+    text = "".join(raw_lines)
+    if len(text) > MAX_FILE_CHARS:
+        text = (
+            text[:MAX_FILE_CHARS]
+            + f"\n\n... [truncated {len(text) - MAX_FILE_CHARS} chars to fit 4K context window]"
+        )
+    return text, span_label
+
+
+def resolve_text_input(
+    positional: list[str],
+    file_path: str | None = None,
+    selection: str | None = None,
+    lines_spec: str | None = None,
+    read_stdin: bool = True,
+) -> str:
+    """Resolve user input from selection, file/line span, CLI arguments, or piped stdin."""
+    if selection and selection.strip():
+        return selection.strip()
+    if positional:
+        return " ".join(positional).strip()
+    if file_path:
+        text, _ = read_file_excerpt(file_path, lines_spec)
+        return text.strip()
+    if read_stdin and not sys.stdin.isatty():
+        data = sys.stdin.read().strip()
+        if data:
+            return data
+    raise ValueError("No input text provided. Pass text arguments, --file, --selection, or pipe stdin.")
+
+
+def select_tier_model(args: argparse.Namespace, default_model: str) -> str:
+    """Pick the requested Mac Pro optimized preset while defaulting to task best."""
+    if getattr(args, "fast", False):
+        return "trash-fast"
+    if getattr(args, "social", False):
+        return "trash-social"
+    if getattr(args, "coder7b", False):
+        return "trash-code"
+    if getattr(args, "deep", False):
+        return "trash-deep"
+    if getattr(args, "heavy", False):
+        return "trash-heavy"
+    return default_model
+
+
+def print_banner(host: str, port: int, model: str, quiet: bool) -> None:
+    """Print hardware-backed model metadata to stderr."""
+    if quiet:
+        return
+    meta = MODEL_PROFILES.get(model, {})
+    label = meta.get("label", model)
+    hw = meta.get("hardware", "Mac Pro Optimized")
+    sys.stderr.write(f"[TrashCanAI @ {host}:{port}] {model} -> {label} | {hw}\n")
+    sys.stderr.flush()
+
+
+def stream_chat(
+    host: str,
+    port: int,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float = 0.1,
+    max_tokens: int = 1024,
+    quiet: bool = False,
+    wrap_html_src: str | None = None,
+) -> str:
+    """Stream a chat completion from the Mac Pro router and report generation timings."""
+    ensure_router(host, port)
+    print_banner(host, port, model, quiet)
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    req = urllib.request.Request(
+        f"{base_url(host, port)}/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+
+    t0 = time.perf_counter()
+    first_token_time: float | None = None
+    chunks: list[str] = []
+    timings: dict[str, Any] = {}
+
+    if wrap_html_src is not None:
+        sys.stdout.write(f'<img src="{wrap_html_src}" alt="')
+        sys.stdout.flush()
+
+    try:
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if data_str == "[DONE]":
+                    break
+                obj = json.loads(data_str)
+                if "timings" in obj and isinstance(obj["timings"], dict):
+                    timings = obj["timings"]
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    tok = delta.get("content")
+                    if tok:
+                        is_first = first_token_time is None
+                        if is_first:
+                            first_token_time = time.perf_counter()
+                        if wrap_html_src is not None:
+                            tok_out = tok.replace('"', "&quot;").replace("\n", " ")
+                            if is_first:
+                                tok_out = tok_out.lstrip()
+                        else:
+                            tok_out = tok
+                        chunks.append(tok)
+                        sys.stdout.write(tok_out)
+                        sys.stdout.flush()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Mac Pro server returned HTTP {exc.code}: {body}") from exc
+
+    if wrap_html_src is not None:
+        sys.stdout.write('">')
+    if not chunks or not chunks[-1].endswith("\n"):
+        sys.stdout.write("\n")
+    sys.stdout.flush()
+
+    elapsed = time.perf_counter() - t0
+    if not quiet:
+        pp = timings.get("prompt_per_second")
+        tg = timings.get("predicted_per_second")
+        pred_n = timings.get("predicted_n")
+        if pp is not None and tg is not None:
+            sys.stderr.write(
+                f"[Done in {elapsed:.2f}s | prompt: {pp:.1f} tok/s | gen: {tg:.1f} tok/s ({pred_n} tokens)]\n"
+            )
+        else:
+            ttft = (first_token_time - t0) if first_token_time else elapsed
+            sys.stderr.write(f"[Done in {elapsed:.2f}s | first token: {ttft:.2f}s]\n")
+        sys.stderr.flush()
+
+    return "".join(chunks)
+
+
+def cmd_spellcheck(args: argparse.Namespace) -> int:
+    """Fix spelling, typos, homophones, grammar, and punctuation cleanly."""
+    text = resolve_text_input(args.text, args.file, args.selection, args.lines)
+    model = select_tier_model(args, default_model="trash-social")
+    system = (
+        "You are a careful proofreader. Fix spelling, typos, split or merged words, "
+        "punctuation, grammar, and wrong sound-alike words based on context. "
+        "Keep the author's casual tone and exact meaning. Reply ONLY with the corrected text."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": "we shoud check the bare wires atm y desk it looks to hot"},
+        {"role": "assistant", "content": "We should check the bare wires at my desk; it looks too hot."},
+        {"role": "user", "content": "another way too save power is turnig of the screen at night"},
+        {"role": "assistant", "content": "Another way to save power is turning off the screen at night."},
+        {"role": "user", "content": text},
+    ]
+    stream_chat(
+        args.host,
+        args.port,
+        model,
+        messages,
+        temperature=0.1,
+        max_tokens=1024,
+        quiet=args.quiet,
+    )
+    return 0
+
+
+def cmd_hashtag(args: argparse.Namespace) -> int:
+    """Generate concise social/community hashtags and optional caption."""
+    topic = resolve_text_input(args.topic, args.file, None)
+    model = select_tier_model(args, default_model="trash-social")
+    caption_note = (
+        "First write 1 short punchy hook sentence, then on a new line write the hashtags."
+        if args.caption
+        else "Reply ONLY with the hashtags separated by single spaces, no other text."
+    )
+    system = (
+        f"Generate exactly {args.count} relevant social/community hashtags in CamelCase. "
+        f"Every hashtag MUST start with '#' (for example: #MacPro2013 #LocalAI #LinuxTech). "
+        f"{caption_note}"
+    )
+    stream_chat(
+        args.host,
+        args.port,
+        model,
+        [{"role": "system", "content": system}, {"role": "user", "content": topic}],
+        temperature=0.3,
+        max_tokens=256,
+        quiet=args.quiet,
+    )
+    return 0
+
+
+def cmd_code(args: argparse.Namespace) -> int:
+    """Run coding help, review, refactoring, or Jetpack Compose generation."""
+    model = select_tier_model(args, default_model="trash-code")
+    prompt_text = " ".join(args.prompt).strip()
+    selection_text = (args.selection or "").strip()
+    file_text, span_label = ("", None)
+    if args.file:
+        file_text, span_label = read_file_excerpt(args.file, args.lines)
+        file_text = file_text.strip()
+
+    if not prompt_text and not selection_text and not file_text and not sys.stdin.isatty():
+        prompt_text = sys.stdin.read().strip()
+
+    parts: list[str] = []
+    if prompt_text:
+        parts.append(prompt_text)
+    if args.file:
+        fname = Path(args.file).name
+        if selection_text:
+            parts.append(f"Selected code from `{fname}`:\n```\n{selection_text}\n```")
+        elif file_text:
+            scope = f" ({span_label})" if span_label else ""
+            parts.append(f"File `{fname}`{scope}:\n```\n{file_text}\n```")
+    elif selection_text:
+        parts.append(f"```\n{selection_text}\n```")
+
+    user_content = "\n\n".join(parts).strip()
+    if not user_content:
+        raise ValueError("Provide a coding prompt, --file, --selection, or stdin.")
+
+    lang_hint = f" Focus on {args.lang}." if args.lang else ""
+    system = (
+        "You are an expert Android (Kotlin/Jetpack Compose) and Linux systems engineer. "
+        "Provide concise, production-ready code and clear technical explanations." + lang_hint
+    )
+    stream_chat(
+        args.host,
+        args.port,
+        model,
+        [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+        temperature=0.2,
+        max_tokens=1536,
+        quiet=args.quiet,
+    )
+    return 0
+
+
+def encode_image_data_uri(image_path: str) -> str:
+    """Encode a local image file as a base64 data URI."""
+    p = Path(image_path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Image file not found: {image_path}")
+    mime, _ = mimetypes.guess_type(str(p))
+    if not mime or not mime.startswith("image/"):
+        mime = "image/jpeg"
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def cmd_alt_text(args: argparse.Namespace) -> int:
+    """Generate HTML accessibility alt-text for an image using Moondream2 on Dual D500s."""
+    data_uri = encode_image_data_uri(args.image)
+    prompt = args.prompt or "Write a concise HTML accessibility alt text for this image (one sentence)."
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": data_uri}},
+                {"type": "text", "text": prompt},
+            ],
+        },
+    ]
+    wrap_src = Path(args.image).name if args.html else None
+    stream_chat(
+        args.host,
+        args.port,
+        "trash-vision",
+        messages,
+        temperature=0.0,
+        max_tokens=96,
+        quiet=args.quiet,
+        wrap_html_src=wrap_src,
+    )
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Show live Mac Pro router status and loaded model state."""
+    data = ensure_router(args.host, args.port)
+    print(f"Mac Pro Router: {base_url(args.host, args.port)} (ONLINE)")
+    print("-" * 78)
+    for item in data.get("data", []):
+        mid = item.get("id", "?")
+        status = (item.get("status") or {}).get("value", "unknown")
+        meta = MODEL_PROFILES.get(mid, {})
+        speed = meta.get("speed", "")
+        hw = meta.get("hardware", "")
+        mark = "● LOADED  " if status == "loaded" else "○ unloaded"
+        print(f"  {mid:<13} [{mark}] | {hw} | {speed}")
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """List optimized Mac Pro presets and their hardware configurations."""
+    print(f"TrashCanAI Optimized Presets (Mac Pro @ {base_url(args.host, args.port)})")
+    print("-" * 86)
+    for mid, meta in MODEL_PROFILES.items():
+        print(f"  {mid:<13} | {meta['label']:<30} | {meta['speed']}")
+        print(f"                | Setup: {meta['hardware']} — {meta['role']}")
+    return 0
+
+
+def add_tier_flags(parser: argparse.ArgumentParser) -> None:
+    """Add optional Mac Pro preset override flags to a subparser."""
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--fast", action="store_true", help="Use trash-fast (1.5B Dual-GPU, 36.6 tok/s)")
+    group.add_argument("--social", action="store_true", help="Use trash-social (3B Dual-GPU, 22.1 tok/s)")
+    group.add_argument("--7b", dest="coder7b", action="store_true", help="Use trash-code (7B Dual-GPU, 13.0 tok/s)")
+    group.add_argument("--deep", action="store_true", help="Use trash-deep (14B Hybrid 24L, 6.4 tok/s)")
+    group.add_argument("--heavy", action="store_true", help="Use trash-heavy (32B 64GB RAM CPU, 2.5 tok/s)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-q", "--quiet", action="store_true", default=argparse.SUPPRESS, help="Suppress banner/timings on stderr")
+
+    parser = argparse.ArgumentParser(
+        prog="trash-ai",
+        parents=[common],
+        description="Run coding, proofreading, hashtag, and vision tasks against a 2013 Mac Pro AI router.",
+    )
+    parser.add_argument("--host", default=DEFAULT_HOST, help=f"Mac Pro IP/hostname (default: {DEFAULT_HOST})")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Router port (default: {DEFAULT_PORT})")
+    parser.set_defaults(quiet=False)
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_spell = sub.add_parser("spellcheck", aliases=["fix"], parents=[common], help="Fix spelling, homophones, grammar & punctuation")
+    p_spell.add_argument("text", nargs="*", help="Text to proofread (or omit to read --file / stdin)")
+    p_spell.add_argument("-f", "--file", help="Path to file to proofread")
+    p_spell.add_argument("-s", "--selection", help="Selected editor text")
+    p_spell.add_argument("--lines", help="1-indexed line span 'start-end' for IDE selection")
+    add_tier_flags(p_spell)
+    p_spell.set_defaults(func=cmd_spellcheck)
+
+    p_hash = sub.add_parser("hashtag", aliases=["tags"], parents=[common], help="Generate social/community hashtags")
+    p_hash.add_argument("topic", nargs="*", help="Post topic or text snippet")
+    p_hash.add_argument("-f", "--file", help="Read topic from file")
+    p_hash.add_argument("-c", "--count", type=int, default=8, help="Number of hashtags (default: 8)")
+    p_hash.add_argument("--caption", action="store_true", help="Also generate a 1-line hook caption")
+    add_tier_flags(p_hash)
+    p_hash.set_defaults(func=cmd_hashtag)
+
+    p_code = sub.add_parser("code", parents=[common], help="Android/Kotlin & Linux code help (defaults to 7B Dual-GPU)")
+    p_code.add_argument("prompt", nargs="*", help="Coding question or instruction")
+    p_code.add_argument("-f", "--file", help="Source file path for context")
+    p_code.add_argument("-s", "--selection", help="Selected editor code snippet")
+    p_code.add_argument("--lines", help="1-indexed line span 'start-end' for IDE selection")
+    p_code.add_argument("-l", "--lang", help="Target language hint (e.g. kotlin, bash, python)")
+    add_tier_flags(p_code)
+    p_code.set_defaults(func=cmd_code)
+
+    p_vis = sub.add_parser("alt-text", aliases=["vision"], parents=[common], help="Generate HTML alt-text via Moondream2")
+    p_vis.add_argument("image", help="Path to local image file")
+    p_vis.add_argument("-p", "--prompt", help="Custom vision prompt")
+    p_vis.add_argument("--html", action="store_true", help="Wrap output in an HTML <img alt=\"...\"> tag")
+    p_vis.set_defaults(func=cmd_alt_text)
+
+    p_status = sub.add_parser("status", parents=[common], help="Show live Mac Pro router & loaded model status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_models = sub.add_parser("models", parents=[common], help="List Mac Pro optimized presets & speeds")
+    p_models.set_defaults(func=cmd_models)
+
+    return parser
+
+
+def main() -> int:
+    """Entry point for trash-ai CLI."""
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        sys.stderr.write(f"[-] trash-ai error: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
